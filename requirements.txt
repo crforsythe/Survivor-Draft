@@ -1,0 +1,6 @@
+streamlit
+supabase
+pandas
+beautifulsoup4
+toml
+plotly
