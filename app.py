@@ -415,6 +415,8 @@ with st.expander("ℹ️ How to Play", expanded=False):
 | Correctly predicted the Winner | +5 bonus (stacks with Final 3) |
 
 Scores update automatically after each episode once the show admin enters the latest elimination in the database.
+
+**Perfect game** (all 24 predictions exactly right): `300 base + 24 exact + 9 final-3 + 5 winner = 338 pts`
 """)
 
 
@@ -489,7 +491,10 @@ if "username" in st.session_state and st.session_state["username"]:
             "Rank every castaway from **1** (first boot) to **24** (Sole Survivor). "
             "All 24 must be filled in and each number can only be used once."
         )
-        st.info("👆 **Double-click** any cell in the **Your Rank** column to enter or change a number, then click **💾 Save My Picks** when you're done.")
+        st.info("👆 **Double-click** any cell in the **Your Rank** column to enter or change a number. Changes **auto-save** on each edit — or hit **💾 Save My Picks** to save manually.")
+
+        # Per-user session-state baseline so auto-save can detect real changes
+        _cache_key = f"picks_baseline_{username}"
 
         with st.spinner("Loading your picks…"):
             try:
@@ -499,15 +504,21 @@ if "username" in st.session_state and st.session_state["username"]:
                 picks_df = pd.DataFrame()
 
         if not picks_df.empty:
-            n_players = len(picks_df)
+            n_players  = len(picks_df)
+            editor_data = picks_df[["player_name", "tribe", "predicted_rank"]]
+
+            # Seed baseline from DB on first visit — prevents a false auto-save on initial render
+            if _cache_key not in st.session_state:
+                st.session_state[_cache_key] = editor_data.copy()
+
             edited = st.data_editor(
-                picks_df[["player_name", "tribe", "predicted_rank"]],
+                editor_data,
                 column_config={
                     "player_name": st.column_config.TextColumn("Castaway", disabled=True),
                     "tribe":       st.column_config.TextColumn("Tribe", disabled=True),
                     "predicted_rank": st.column_config.NumberColumn(
                         "Your Rank",
-                        help="1 = first voted out  ·  24 = Sole Survivor",
+                        help="1 = first voted out  ·  24 = Sole Survivor",
                         min_value=1,
                         max_value=n_players,
                         step=1,
@@ -519,21 +530,42 @@ if "username" in st.session_state and st.session_state["username"]:
             )
 
             ranks_filled = edited["predicted_rank"].dropna()
-            n_filled = len(ranks_filled)
-            n_total = n_players
+            n_filled     = len(ranks_filled)
+            n_total      = n_players
 
+            def _dupes() -> list[int]:
+                return sorted(ranks_filled[ranks_filled.duplicated()].astype(int).tolist())
+
+            def _persist(source: str) -> None:
+                save_user_predictions(username, edited)
+                st.session_state[_cache_key] = edited[["player_name", "tribe", "predicted_rank"]].copy()
+                msg = f"✅ {source} — {n_filled}/{n_total} picks saved."
+                if n_filled < n_total:
+                    msg += f" ({n_total - n_filled} still unranked)"
+                st.success(msg)
+
+            # ── Auto-save whenever the editor differs from the last-saved baseline ──
+            current  = edited[["player_name", "tribe", "predicted_rank"]].reset_index(drop=True)
+            baseline = st.session_state[_cache_key].reset_index(drop=True)
+            if not current.equals(baseline):
+                bad = _dupes()
+                if bad:
+                    st.warning(f"Duplicate rank(s) {bad} detected — fix to enable auto-save.")
+                else:
+                    try:
+                        _persist("Auto-saved")
+                    except Exception as e:
+                        st.error(f"Auto-save failed: {e}")
+
+            # ── Manual save button (always available as a fallback) ──────────
             if st.button("💾 Save My Picks", type="primary", use_container_width=True):
-                if ranks_filled.nunique() < n_filled:
-                    dupes = sorted(ranks_filled[ranks_filled.duplicated()].astype(int).tolist())
-                    st.warning(f"Duplicate rank(s): {dupes}. Each number must be used exactly once.")
+                bad = _dupes()
+                if bad:
+                    st.warning(f"Duplicate rank(s): {bad}. Each number must be used exactly once.")
                 else:
                     with st.spinner("Saving…"):
                         try:
-                            save_user_predictions(username, edited)
-                            saved_msg = f"✅ {n_filled}/{n_total} picks saved."
-                            if n_filled < n_total:
-                                saved_msg += f" ({n_total - n_filled} castaways still unranked.)"
-                            st.success(saved_msg)
+                            _persist("Saved")
                         except Exception as e:
                             st.error(f"Save failed: {e}")
 
@@ -615,6 +647,11 @@ if "username" in st.session_state and st.session_state["username"]:
 
             with col_bar:
                 st.markdown("#### 🏆 Current Standings")
+                # Perfect game: sum(1..n) base + n exact bonuses + 3×final-3 + 5 winner
+                _n = len(scores_df) if not scores_df.empty else 24
+                _n_cast = scores_df["Picks Scored"].max() if not scores_df.empty else _n
+                _perfect = sum(range(1, _n + 1)) + _n + 9 + 5
+                st.caption(f"🌟 Perfect game score: **{_perfect} pts** (all {_n} predictions exact)")
                 bar_df = scores_df.sort_values("Score")
                 fig_bar = px.bar(
                     bar_df,
@@ -640,6 +677,23 @@ if "username" in st.session_state and st.session_state["username"]:
             with col_line:
                 st.markdown("#### 📈 Score Progression")
                 if not prog_df.empty:
+                    elim_ranks = sorted(prog_df["Elimination"].unique())
+                    n_total = n_elim + n_rem   # total cast size
+
+                    # Build cumulative perfect-game score at each elimination step
+                    # Base: exact match at rank r → r pts; +1 exact bonus;
+                    # +3 for each of the final-3 members; +5 for winner
+                    _running = 0
+                    perfect_x, perfect_y = [], []
+                    for r in elim_ranks:
+                        _running += r + 1                              # base + exact bonus
+                        if r >= n_total - 2:                           # final-3 member
+                            _running += 3
+                        if r == n_total:                               # winner
+                            _running += 5
+                        perfect_x.append(r)
+                        perfect_y.append(_running)
+
                     fig_line = px.line(
                         prog_df,
                         x="Elimination",
@@ -647,6 +701,14 @@ if "username" in st.session_state and st.session_state["username"]:
                         color="Player",
                         markers=True,
                         color_discrete_sequence=px.colors.qualitative.Bold,
+                    )
+                    fig_line.add_scatter(
+                        x=perfect_x,
+                        y=perfect_y,
+                        mode="lines",
+                        name="✨ Perfect Game",
+                        line=dict(dash="dot", color="#FFD700", width=2),
+                        hovertemplate="Perfect game: %{y} pts<extra></extra>",
                     )
                     fig_line.update_layout(
                         margin=dict(l=0, r=10, t=10, b=0),
