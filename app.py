@@ -735,7 +735,7 @@ if "username" in st.session_state and st.session_state["username"]:
 
                 def colour_tribe_row(row):
                     bg = tribe_colours.get(row.get("tribe", ""), "")
-                    return [f"background-color:{bg}" if bg else "" for _ in row]
+                    return [f"background-color:{bg}; color:black" if bg else "" for _ in row]
 
                 display_df = overview_df.reset_index()
                 fmt = {c: lambda x: str(int(x)) if pd.notna(x) else "—" for c in user_cols}
